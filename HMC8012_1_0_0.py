@@ -33,6 +33,7 @@ class HMC8012GUI(QMainWindow):
         self.data_log_file = None
         self.measurement_thread = None
         self.data_lock = threading.Lock()
+        self.hires_logging_timer = None  # Timer for timed hi-res logging
 
         # Данные для отображения
         self.time_data = deque(maxlen=1000)
@@ -161,6 +162,18 @@ class HMC8012GUI(QMainWindow):
         self.hires_checkbox.stateChanged.connect(self.on_hires_changed)
         hires_layout.addWidget(self.hires_checkbox)
 
+        # Время логирования
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(QLabel("Duration (s):"))
+        self.hires_time_input = QSpinBox()
+        self.hires_time_input.setRange(0, 3600)
+        self.hires_time_input.setValue(0)
+        self.hires_time_input.setSuffix(" s")
+        self.hires_time_input.setToolTip("0 = Infinite logging")
+        time_layout.addWidget(self.hires_time_input)
+        time_layout.addStretch()
+        hires_layout.addLayout(time_layout)
+
         # Статус hi-res логирования (3 состояния)
         hires_status_layout = QHBoxLayout()
         hires_status_layout.addWidget(QLabel("Status:"))
@@ -255,13 +268,30 @@ class HMC8012GUI(QMainWindow):
             self.hires_checkbox.setChecked(True)
 
             self.instrument.write("DATA:LOG:INTerval 0")
-            timestamp = datetime.now().strftime("%H%M%d")
+            
+            # Set logging mode based on duration
+            hires_duration = self.hires_time_input.value()
+            if hires_duration == 0:
+                # Infinite logging mode
+                self.instrument.write("DATA:LOG:MODE UNL")
+            else:
+                # Time-based logging mode
+                self.instrument.write("DATA:LOG:MODE TIME")
+                self.instrument.write(f"DATA:LOG:TIME {hires_duration}")
+            
+            timestamp = datetime.now().strftime("%d%H%M%S")
             filename = f"{timestamp}.csv"
             self.instrument.write(f"DATA:LOG:FNAM '{filename}', EXT")
             path = self.instrument.query("DATA:LOG:FNAM?")
             global USB_filename
-            USB_filename = (path.split('/')[-1])[0:-2]
-
+            USB_filename = (path.split('/')[-1])[0:-2]            
+            # If time-based logging, set up auto-disable timer
+            if hires_duration > 0:
+                if self.hires_logging_timer is None:
+                    self.hires_logging_timer = QTimer()
+                    self.hires_logging_timer.timeout.connect(self.on_hires_logging_timeout)
+                # Convert seconds to milliseconds
+                self.hires_logging_timer.start(hires_duration * 1000)
             script_dir = os.path.dirname(os.path.abspath(__file__))
             global local_filename
             local_filename = f"hires_transfer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -290,6 +320,23 @@ class HMC8012GUI(QMainWindow):
             self.hires_filename_label.setText("None")
             pause_event.set()
             print(f"Error enabling hi-res logging: {e}")
+
+    def on_hires_logging_timeout(self):
+        """Handle timed hi-res logging completion."""
+        if self.hires_logging_timer:
+            self.hires_logging_timer.stop()
+        # Wait 3 seconds to allow multimeter to finalize logging, then disable and transfer
+        self.hires_status_label.setText("Finalizing")
+        self.hires_status_label.setStyleSheet("color: yellow; font-weight: bold;")
+        QTimer.singleShot(3000, self.finalize_hires_logging)
+    
+    def finalize_hires_logging(self):
+        """Complete hi-res logging after finalization delay."""
+        # Uncheck the checkbox to trigger disable_hires_logging
+        self.hires_checkbox.blockSignals(True)
+        self.hires_checkbox.setChecked(False)
+        self.hires_checkbox.blockSignals(False)
+        self.disable_hires_logging()
 
     def disable_hires_logging(self):
         """
@@ -321,6 +368,9 @@ class HMC8012GUI(QMainWindow):
             # -----------------------------------------------------------
 
             self.is_hires_logging = False
+            # Stop the timer if it's running
+            if self.hires_logging_timer:
+                self.hires_logging_timer.stop()
             print("hi-res logging disabled")
             pause_event.set()
 
@@ -499,7 +549,7 @@ class HMC8012GUI(QMainWindow):
         try:
             visa_address = f"TCPIP0::{ip}::INSTR"
             self.instrument = self.rm.open_resource(visa_address)
-            self.instrument.timeout = 5000
+            self.instrument.timeout = 25000
             idn = self.instrument.query("*IDN?")
             self.is_connected = True
             self.status_label.setText(f"Status: Connected\n{idn.strip()}")
