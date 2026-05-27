@@ -17,6 +17,11 @@ import threading
 from collections import deque
 import os
 
+try:
+    import allantools
+except ImportError:
+    allantools = None
+
 pause_event = threading.Event()
 pause_event.set()
 
@@ -33,6 +38,7 @@ class HMC8012GUI(QMainWindow):
         self.data_log_file = None
         self.measurement_thread = None
         self.data_lock = threading.Lock()
+        self.hires_logging_timer = None  # Timer for timed hi-res logging
 
         # Данные для отображения
         self.time_data = deque(maxlen=1000)
@@ -58,12 +64,15 @@ class HMC8012GUI(QMainWindow):
         self.current_unit = "V"
         self.current_ylabel = "Voltage (V)"
         self.current_legend = "Voltage"
+        
+        # ADC mode
+        self.adc_mode = "SLOW"
 
         # Настройки по умолчанию
         self.settings = {
             'ip': '192.168.11.23',
             'port': '5025',
-            'sample_rate': 5,
+            'sample_rate': 500,
             'display_seconds': 30,
             'visa_address': 'TCPIP0::{ip}::INSTR'
         }
@@ -108,11 +117,11 @@ class HMC8012GUI(QMainWindow):
         settings_group = QGroupBox("Measurement Settings")
         settings_layout = QFormLayout()
         self.sample_rate_input = QSpinBox()
-        self.sample_rate_input.setRange(1, 20)
+        self.sample_rate_input.setRange(1, 20000)
         self.sample_rate_input.setValue(self.settings['sample_rate'])
-        self.sample_rate_input.setSuffix(" Hz")
+        self.sample_rate_input.setSuffix(" mHz")
         self.display_time_input = QSpinBox()
-        self.display_time_input.setRange(1, 300)
+        self.display_time_input.setRange(1, 300000)
         self.display_time_input.setValue(self.settings['display_seconds'])
         self.display_time_input.setSuffix(" s")
         self.measurement_type_combo = QComboBox()
@@ -124,6 +133,18 @@ class HMC8012GUI(QMainWindow):
         settings_layout.addRow("Measurement Type:", self.measurement_type_combo)
         settings_group.setLayout(settings_layout)
         left_layout.addWidget(settings_group)
+
+        # ADC Mode Selection
+        adc_group = QGroupBox("ADC Mode")
+        adc_layout = QFormLayout()
+        self.adc_combo = QComboBox()
+        self.adc_combo.addItem("Slow", "SLOW")
+        self.adc_combo.addItem("Fast", "FAST")
+        self.adc_combo.setCurrentIndex(0)
+        self.adc_combo.currentIndexChanged.connect(self.on_adc_mode_changed)
+        adc_layout.addRow("Mode:", self.adc_combo)
+        adc_group.setLayout(adc_layout)
+        left_layout.addWidget(adc_group)
 
         # ========== ИЗМЕНЕНО: секция логирования разделена на локальное и hi-res ==========
         logging_group = QGroupBox("Data Logging")
@@ -160,6 +181,18 @@ class HMC8012GUI(QMainWindow):
         self.hires_checkbox = QCheckBox("Enable hi-res logging on USB")
         self.hires_checkbox.stateChanged.connect(self.on_hires_changed)
         hires_layout.addWidget(self.hires_checkbox)
+
+        # Время логирования
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(QLabel("Duration (s):"))
+        self.hires_time_input = QSpinBox()
+        self.hires_time_input.setRange(0, 3600)
+        self.hires_time_input.setValue(0)
+        self.hires_time_input.setSuffix(" s")
+        self.hires_time_input.setToolTip("0 = Infinite logging")
+        time_layout.addWidget(self.hires_time_input)
+        time_layout.addStretch()
+        hires_layout.addLayout(time_layout)
 
         # Статус hi-res логирования (3 состояния)
         hires_status_layout = QHBoxLayout()
@@ -225,12 +258,37 @@ class HMC8012GUI(QMainWindow):
         left_layout.addWidget(control_group)
         left_layout.addStretch()
 
-        # Правая панель (график) без изменений
+        # Правая панель (табуляция с графиками)
         right_panel = QFrame()
         right_layout = QVBoxLayout(right_panel)
+        
+        # Создаем QTabWidget
+        self.tabs = QTabWidget()
+        
+        # ===== TAB 1: Measurement Graph =====
+        tab1 = QWidget()
+        tab1_layout = QVBoxLayout(tab1)
         self.figure = Figure(figsize=(10, 8), dpi=100)
         self.canvas = FigureCanvas(self.figure)
-        right_layout.addWidget(self.canvas)
+        tab1_layout.addWidget(self.canvas)
+        self.tabs.addTab(tab1, "Measurement")
+        
+        # ===== TAB 2: Allan Deviation =====
+        tab2 = QWidget()
+        tab2_layout = QVBoxLayout(tab2)
+        self.figure_adev = Figure(figsize=(10, 8), dpi=100)
+        self.canvas_adev = FigureCanvas(self.figure_adev)
+        tab2_layout.addWidget(self.canvas_adev)
+        
+        # Add label for allantools status
+        if allantools is None:
+            warning_label = QLabel("⚠ allantools not installed. Install with: pip install allantools")
+            warning_label.setStyleSheet("color: orange; font-weight: bold; padding: 5px;")
+            tab2_layout.insertWidget(0, warning_label)
+        
+        self.tabs.addTab(tab2, "Allan Deviation")
+        
+        right_layout.addWidget(self.tabs)
 
         main_layout.addWidget(left_panel)
         main_layout.addWidget(right_panel, 1)
@@ -255,13 +313,30 @@ class HMC8012GUI(QMainWindow):
             self.hires_checkbox.setChecked(True)
 
             self.instrument.write("DATA:LOG:INTerval 0")
-            timestamp = datetime.now().strftime("%H%M%d")
+            
+            # Set logging mode based on duration
+            hires_duration = self.hires_time_input.value()
+            if hires_duration == 0:
+                # Infinite logging mode
+                self.instrument.write("DATA:LOG:MODE UNL")
+            else:
+                # Time-based logging mode
+                self.instrument.write("DATA:LOG:MODE TIME")
+                self.instrument.write(f"DATA:LOG:TIME {hires_duration}")
+            
+            timestamp = datetime.now().strftime("%d%H%M%S")
             filename = f"{timestamp}.csv"
             self.instrument.write(f"DATA:LOG:FNAM '{filename}', EXT")
             path = self.instrument.query("DATA:LOG:FNAM?")
             global USB_filename
-            USB_filename = (path.split('/')[-1])[0:-2]
-
+            USB_filename = (path.split('/')[-1])[0:-2]            
+            # If time-based logging, set up auto-disable timer
+            if hires_duration > 0:
+                if self.hires_logging_timer is None:
+                    self.hires_logging_timer = QTimer()
+                    self.hires_logging_timer.timeout.connect(self.on_hires_logging_timeout)
+                # Convert seconds to milliseconds
+                self.hires_logging_timer.start(hires_duration * 1000)
             script_dir = os.path.dirname(os.path.abspath(__file__))
             global local_filename
             local_filename = f"hires_transfer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -290,6 +365,23 @@ class HMC8012GUI(QMainWindow):
             self.hires_filename_label.setText("None")
             pause_event.set()
             print(f"Error enabling hi-res logging: {e}")
+
+    def on_hires_logging_timeout(self):
+        """Handle timed hi-res logging completion."""
+        if self.hires_logging_timer:
+            self.hires_logging_timer.stop()
+        # Wait 3 seconds to allow multimeter to finalize logging, then disable and transfer
+        self.hires_status_label.setText("Finalizing")
+        self.hires_status_label.setStyleSheet("color: yellow; font-weight: bold;")
+        QTimer.singleShot(3000, self.finalize_hires_logging)
+    
+    def finalize_hires_logging(self):
+        """Complete hi-res logging after finalization delay."""
+        # Uncheck the checkbox to trigger disable_hires_logging
+        self.hires_checkbox.blockSignals(True)
+        self.hires_checkbox.setChecked(False)
+        self.hires_checkbox.blockSignals(False)
+        self.disable_hires_logging()
 
     def disable_hires_logging(self):
         """
@@ -321,6 +413,9 @@ class HMC8012GUI(QMainWindow):
             # -----------------------------------------------------------
 
             self.is_hires_logging = False
+            # Stop the timer if it's running
+            if self.hires_logging_timer:
+                self.hires_logging_timer.stop()
             print("hi-res logging disabled")
             pause_event.set()
 
@@ -369,7 +464,7 @@ class HMC8012GUI(QMainWindow):
                 f"# IP Address: {self.ip_input.text()}",
                 f"# Measurement Type: {self.measurement_types[self.current_measurement_type]['name']}",
                 f"# Unit: {self.current_unit}",
-                f"# Sample Rate: {self.sample_rate_input.value()} Hz",
+                f"# Sample Rate: {self.sample_rate_input.value()} mHz",
                 f"# Hi-Res Mode: {'Enabled' if self.hires_checkbox.isChecked() else 'Disabled'}",
                 "#"
             ]
@@ -424,7 +519,7 @@ class HMC8012GUI(QMainWindow):
             measurement_info = self.measurement_types[measurement_key]
             self.current_unit = measurement_info["unit"]
             self.current_ylabel = measurement_info["ylabel"]
-            self.current_legend = measurement_info["legend"]
+            #self.current_legend = measurement_info["legend"]
             self.update_plot_labels()
             if self.is_measuring and self.instrument:
                 try:
@@ -444,6 +539,16 @@ class HMC8012GUI(QMainWindow):
                 self.ax.legend(loc='upper right')
             self.canvas.draw()
 
+    def on_adc_mode_changed(self, index):
+        """Handle ADC mode change (SLOW or FAST)."""
+        self.adc_mode = self.adc_combo.itemData(index)
+        if self.is_connected and self.instrument:
+            try:
+                self.instrument.write(f"ADCR {self.adc_mode}")
+                print(f"ADC mode set to: {self.adc_mode}")
+            except Exception as e:
+                print(f"Error setting ADC mode: {e}")
+
     def init_plot(self):
         """Инициализация графика."""
         self.figure.clear()
@@ -454,7 +559,7 @@ class HMC8012GUI(QMainWindow):
         self.ax.set_title(f'HMC8012 - {self.measurement_types[self.current_measurement_type]["name"]} Measurement',
                           fontsize=14, pad=20)
         self.ax.grid(True, alpha=0.3)
-        self.ax.legend(loc='upper right')
+        #self.ax.legend(loc='upper right')
         self.stats_text = self.ax.text(0.02, 0.95, '',
                                        transform=self.ax.transAxes,
                                        fontsize=10,
@@ -463,18 +568,40 @@ class HMC8012GUI(QMainWindow):
                                                  facecolor='wheat',
                                                  alpha=0.8))
         self.canvas.draw()
+        
+        # Initialize Allan deviation plot
+        self.init_adev_plot()
+
+    def init_adev_plot(self):
+        """Инициализация графика Allan Deviation."""
+        self.figure_adev.clear()
+        self.ax_adev = self.figure_adev.add_subplot(111)
+        self.ax_adev.set_xlabel('Averaging Time (s)', fontsize=12)
+        self.ax_adev.set_ylabel('OADEV (absolute)', fontsize=12)
+        self.ax_adev.set_title('Allan Deviation', fontsize=14, pad=20)
+        self.ax_adev.grid(True, alpha=0.3, which='both')
+        self.ax_adev.set_xscale('log')
+        self.ax_adev.set_yscale('log')
+        self.adev_line = None
+        self.adev_tau = None
+        self.adev_values = None
+        self.canvas_adev.draw()
 
     def setup_timer(self):
         self.plot_timer = QTimer()
-        self.plot_timer.timeout.connect(self.update_plot)
+        self.plot_timer.timeout.connect(self.on_plot_timer_update)
         self.plot_timer.start(100)
+    
+    def on_plot_timer_update(self):
+        """Обновляет все графики."""
+        self.update_plot()
+        # Update Allan deviation if enough data and allantools is available
+        if allantools is not None:
+            self.update_adev_plot()
 
     def create_menu(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu('File')
-        export_action = QAction('Export Data', self)
-        export_action.triggered.connect(self.export_data)
-        file_menu.addAction(export_action)
         exit_action = QAction('Exit', self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -499,14 +626,14 @@ class HMC8012GUI(QMainWindow):
         try:
             visa_address = f"TCPIP0::{ip}::INSTR"
             self.instrument = self.rm.open_resource(visa_address)
-            self.instrument.timeout = 5000
+            self.instrument.timeout = 25000
             idn = self.instrument.query("*IDN?")
             self.is_connected = True
             self.status_label.setText(f"Status: Connected\n{idn.strip()}")
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
             self.connect_btn.setText("Disconnect")
             QMessageBox.information(self, "Success", f"Connected to:\n{idn}\nPlease wait for reset")
-            self.instrument.write("ADCR FAST")
+            self.instrument.write("ADCR SLOW")
             self.instrument.write(f"CONF:{self.current_measurement_type}")
             self.instrument.write(f"{self.current_measurement_type}:RANG:AUTO ON")
             self.start_btn.setEnabled(True)
@@ -535,7 +662,7 @@ class HMC8012GUI(QMainWindow):
         if not self.is_connected or not self.instrument:
             QMessageBox.warning(self, "Warning", "Not connected to device")
             return
-        sample_rate = self.sample_rate_input.value()
+        sample_rate = self.sample_rate_input.value()/1000
         try:
             self.instrument.write(f"CONF:{self.current_measurement_type}")
             self.instrument.write(f"{self.current_measurement_type}:RANG:AUTO ON")
@@ -566,7 +693,7 @@ class HMC8012GUI(QMainWindow):
         self.stop_btn.setEnabled(False)
 
     def measurement_loop(self, sample_rate):
-        interval = 1.0 / sample_rate
+        interval = 1.0 / (sample_rate)
         start_time = time.time()
         while self.is_measuring and self.is_connected:
             try:
@@ -647,6 +774,63 @@ class HMC8012GUI(QMainWindow):
             self.std_label.setText(f"{np.std(recent_data):.6f} {self.current_unit}")
         self.canvas.draw_idle()
 
+    def update_adev_plot(self):
+        """Обновляет график Allan Deviation на основе текущих данных."""
+        if not self.full_measurement_data or len(self.full_measurement_data) < 10:
+            return
+        
+        try:
+            with self.data_lock:
+                data = np.array(list(self.full_measurement_data))
+                time_data = np.array(list(self.full_time_data))
+            
+            # Estimate sample rate from time data
+            if len(time_data) < 2:
+                return
+            
+            # Calculate mean time difference to get sample rate
+            time_diffs = np.diff(time_data)
+            if len(time_diffs) > 0:
+                mean_interval = np.mean(time_diffs[time_diffs > 0])
+                if mean_interval <= 0:
+                    return
+                rate = 1.0 / mean_interval
+            else:
+                return
+            
+            # Compute OADEV using allantools
+            # tau values are powers of 2: [1, 2, 4, 8, 16, ...] * sample_interval
+            tau, adev, _, _ = allantools.oadev(data, rate=rate, data_type="freq")
+            
+            # Update the plot
+            self.ax_adev.clear()
+            self.ax_adev.loglog(tau, adev, 'b-', linewidth=2, marker='o', markersize=4)
+            self.ax_adev.set_xlabel('Averaging Time (s)', fontsize=12)
+            self.ax_adev.set_ylabel('OADEV (absolute)', fontsize=12)
+            self.ax_adev.set_title('Allan Deviation', fontsize=14, pad=20)
+            self.ax_adev.grid(True, alpha=0.3, which='both')
+            
+            # Add stats text
+            min_adev = np.min(adev)
+            max_adev = np.max(adev)
+            adev_stats_text = (
+                f"Data Points: {len(data)}\n"
+                f"Sample Rate: {rate:.2f} mHz\n"
+                f"Min ADEV: {min_adev:.2e}\n"
+                f"Max ADEV: {max_adev:.2e}"
+            )
+            stats_box = self.ax_adev.text(0.02, 0.95, adev_stats_text,
+                                          transform=self.ax_adev.transAxes,
+                                          fontsize=10,
+                                          verticalalignment='top',
+                                          bbox=dict(boxstyle='round',
+                                                    facecolor='lightblue',
+                                                    alpha=0.8))
+            self.canvas_adev.draw_idle()
+            
+        except Exception as e:
+            print(f"Error updating Allan deviation plot: {e}")
+
     def clear_data(self):
         reply = QMessageBox.question(self, 'Clear Data',
                                      'Are you sure you want to clear all data?',
@@ -665,6 +849,9 @@ class HMC8012GUI(QMainWindow):
             self.std_label.setText("--")
             self.stats_text.set_text("")
             self.canvas.draw()
+            
+            # Clear Allan deviation plot
+            self.init_adev_plot()
 
     def export_data(self):
         if not self.full_time_data:

@@ -1,0 +1,5 @@
+pyvisa>=1.14.1
+numpy>=1.24.0
+matplotlib>=3.7.0
+PyQt5>=5.15.0
+allantools>=2022.9.7
